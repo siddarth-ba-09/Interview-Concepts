@@ -554,30 +554,319 @@ public class UserSession { }
 
 ### The Scope Mismatch Problem
 
-Injecting a **shorter-lived bean** (e.g., request-scoped) into a **longer-lived bean** (e.g., singleton) causes a classic bug:
+#### What Is the Problem?
+
+Every Spring bean has a **lifecycle**. A singleton bean lives for the entire lifetime of the application context. A request-scoped bean lives only for a single HTTP request. A session-scoped bean lives for a single user's HTTP session.
+
+The scope mismatch problem occurs when you **inject a shorter-lived bean into a longer-lived bean**. Spring resolves constructor/field/setter dependencies **once at startup** when the singleton is created. At that moment, there may be no active HTTP request at all — so Spring either fails, or worse, injects and freezes a single instance of the shorter-lived bean inside the singleton forever.
+
+```
+Singleton lifecycle:  |====== entire app lifetime ============|
+Request scope:        |--req1--|  |--req2--|  |--req3--|
+
+Singleton is created at startup → Spring injects RequestTracker
+→ which RequestTracker instance? There's no request yet!
+→ Even if there was, Request #1's tracker gets locked in forever
+→ Every subsequent request uses Request #1's stale tracker
+```
+
+#### Concrete Bug Example
 
 ```java
-@Component  // singleton
-public class OrderController {
+// A request-scoped bean — should hold data for one HTTP request only
+@Component
+@Scope(WebApplicationContext.SCOPE_REQUEST)   // NO proxyMode — this is the broken version
+public class RequestContext {
+    private String correlationId;
+    private String userId;
+    // getters/setters
+}
 
-    // WRONG — Spring injects one instance at startup; request scope is lost
+// A singleton service — lives forever
+@Service
+public class AuditService {
+
     @Autowired
-    private RequestTracker tracker;
+    private RequestContext requestContext;  // INJECTED ONCE AT STARTUP — WRONG!
+
+    public void audit(String action) {
+        // BUG: requestContext is the SAME stale object for every request
+        // correlationId and userId from request #1 will appear in request #100's audit logs
+        log.info("User {} performed {} [correlationId={}]",
+            requestContext.getUserId(),       // always request #1's userId
+            action,
+            requestContext.getCorrelationId() // always request #1's correlationId
+        );
+    }
 }
 ```
 
-**Fix:** Use `proxyMode = ScopedProxyMode.TARGET_CLASS`. Spring injects a CGLIB proxy; every method call is delegated to the real request/session-scoped instance for the current thread.
+**What actually happens at startup:**
+
+```
+ApplicationContext starts
+  → Creates AuditService (singleton)
+  → Tries to inject RequestContext
+  → No HTTP request is active
+  → Spring throws: java.lang.IllegalStateException:
+      No thread-bound request found: Are you referring to request attributes
+      outside of an actual web request?
+```
+
+Even if startup doesn't crash (e.g., in some lazy scenarios), the bug manifests as **data bleed between requests** — one user's session data leaking into another user's audit trail. In a banking or healthcare app, this is a critical security defect.
+
+#### Why It Happens — The Root Cause
+
+Spring dependency injection is performed **once per singleton bean, at context initialization time**. The container resolves all injection points at that moment and stores the resolved reference. There is no mechanism in basic DI to say "re-resolve this reference on every method call".
+
+```
+Startup (time T=0):
+  AuditService created
+  → @Autowired RequestContext resolved → RequestContext instance #A stored in field
+
+Request 1 (time T=10):
+  AuditService.audit() called
+  → uses RequestContext instance #A  ← correct for request 1, but only by coincidence
+
+Request 2 (time T=20):
+  AuditService.audit() called
+  → still uses RequestContext instance #A  ← WRONG, should be a new instance for request 2
+```
+
+#### The Fix: `proxyMode = ScopedProxyMode.TARGET_CLASS`
+
+The solution is to tell Spring: *"don't inject the real bean — inject a proxy. Every time a method is called on the proxy, look up the real bean for the current thread/request/session and delegate to it."*
 
 ```java
 @Component
-@Scope(value = WebApplicationContext.SCOPE_REQUEST, proxyMode = ScopedProxyMode.TARGET_CLASS)
-public class RequestTracker {
-    private String requestId = UUID.randomUUID().toString();
-    public String getRequestId() { return requestId; }
+@Scope(
+    value = WebApplicationContext.SCOPE_REQUEST,
+    proxyMode = ScopedProxyMode.TARGET_CLASS   // ← this is the fix
+)
+public class RequestContext {
+    private String correlationId = UUID.randomUUID().toString();
+    private String userId;
+    // getters/setters
 }
 ```
 
-> **Interview Tip:** This is a very common interview scenario. The key insight is: **proxyMode = ScopedProxyMode.TARGET_CLASS** solves the injection into singleton problem by deferring resolution to the actual request/session at call time.
+Now Spring injects a **CGLIB proxy** into `AuditService` instead of a real `RequestContext` instance. The proxy holds no data — it is a thin delegation shell. Every time any method on the proxy is called, it:
+
+1. Looks up the current thread's `RequestAttributes` from `RequestContextHolder`
+2. Finds (or creates) the real `RequestContext` for the current HTTP request
+3. Delegates the method call to that real instance
+4. Returns the result
+
+```
+Startup (T=0):
+  AuditService created
+  → @Autowired resolved → CGLIB proxy injected into field (proxy has no real data)
+
+Request 1 (T=10, Thread A):
+  AuditService.audit() called
+  → proxy.getUserId() called
+  → proxy looks up RequestContextHolder for Thread A
+  → finds (or creates) RequestContext#A for this request
+  → returns RequestContext#A.getUserId() → "alice"
+
+Request 2 (T=20, Thread B):
+  AuditService.audit() called
+  → proxy.getUserId() called
+  → proxy looks up RequestContextHolder for Thread B
+  → finds (or creates) RequestContext#B for this request
+  → returns RequestContext#B.getUserId() → "bob"
+```
+
+Each request gets its own `RequestContext` instance. No data bleed. The singleton `AuditService` holds only one proxy reference, yet effectively gets a fresh `RequestContext` per call.
+
+#### How the Proxy Works Internally
+
+```
+AuditService.auditService field
+        │
+        ▼
+  RequestContext$$SpringCGLIB$$0   ← CGLIB-generated proxy class (subclass of RequestContext)
+        │
+        │  on every method call:
+        │    1. RequestContextHolder.currentRequestAttributes()
+        │    2. getAttribute("scopedTarget.requestContext", REQUEST_SCOPE)
+        │    3. if null → create new RequestContext, store it
+        │    4. delegate to real RequestContext instance
+        ▼
+  Real RequestContext instance
+  (stored in request attributes, lives and dies with the HTTP request)
+```
+
+The proxy is created by `ScopedProxyFactoryBean`, which wraps the target bean definition and generates a CGLIB subclass at startup. The real bean is stored under the key `scopedTarget.<beanName>` in the appropriate scope store (request attributes, session attributes, etc.).
+
+#### proxyMode Options
+
+| `ScopedProxyMode` | When to Use |
+|---|---|
+| `NO` (default) | Bean is not proxied — **causes the mismatch bug** if injected into a longer-lived bean |
+| `TARGET_CLASS` | CGLIB proxy — works for any class (with or without interfaces). **Most common fix.** |
+| `INTERFACES` | JDK dynamic proxy — only works if the bean implements at least one interface |
+
+```java
+// Use TARGET_CLASS (works always)
+@Scope(value = WebApplicationContext.SCOPE_REQUEST, proxyMode = ScopedProxyMode.TARGET_CLASS)
+
+// Use INTERFACES only if the bean implements an interface AND you want a JDK proxy
+@Scope(value = WebApplicationContext.SCOPE_SESSION, proxyMode = ScopedProxyMode.INTERFACES)
+public class UserSessionBean implements UserSession { }
+```
+
+#### All Mismatch Combinations
+
+| Injecting (shorter-lived) | Into (longer-lived) | Problem? | Fix |
+|---|---|---|---|
+| `prototype` | `singleton` | Yes — prototype injected once, reused forever | `@Lookup`, `ObjectProvider`, or `ApplicationContext.getBean()` |
+| `request` | `singleton` | Yes — no request at startup | `proxyMode = TARGET_CLASS` |
+| `request` | `session` | Yes — request dies before session | `proxyMode = TARGET_CLASS` |
+| `session` | `singleton` | Yes — session dies, singleton keeps stale ref | `proxyMode = TARGET_CLASS` |
+| `singleton` | `request` | No — singleton lives longer; always available | N/A |
+| `singleton` | `session` | No | N/A |
+| `prototype` | `request` | No — request is shorter-lived, prototype re-injected per request bean creation | N/A |
+
+#### The Prototype-in-Singleton Special Case
+
+Prototype is not a web scope, but it suffers the same mismatch problem. `proxyMode` doesn't help for prototype because a proxy would return the same prototype instance (the one created when the proxy was first used). Instead:
+
+**Option 1: `@Lookup` method injection**
+
+```java
+@Component
+public abstract class OrderProcessor {
+
+    // Spring CGLIB-overrides this method to return a NEW CartSession each call
+    @Lookup
+    public abstract CartSession getCartSession();
+
+    public void processOrder(String orderId) {
+        CartSession session = getCartSession();  // fresh prototype every time
+        session.setOrderId(orderId);
+        // ...
+    }
+}
+```
+
+**Option 2: `ObjectProvider<T>` (recommended — works on concrete classes)**
+
+```java
+@Service
+public class OrderProcessor {
+
+    private final ObjectProvider<CartSession> cartSessionProvider;
+
+    public OrderProcessor(ObjectProvider<CartSession> cartSessionProvider) {
+        this.cartSessionProvider = cartSessionProvider;
+    }
+
+    public void processOrder(String orderId) {
+        CartSession session = cartSessionProvider.getObject();  // new prototype each call
+        session.setOrderId(orderId);
+    }
+}
+```
+
+**Option 3: `ApplicationContext.getBean()`** (least elegant — couples to Spring API)
+
+```java
+@Service
+public class OrderProcessor implements ApplicationContextAware {
+
+    private ApplicationContext ctx;
+
+    @Override
+    public void setApplicationContext(ApplicationContext ctx) {
+        this.ctx = ctx;
+    }
+
+    public void processOrder(String orderId) {
+        CartSession session = ctx.getBean(CartSession.class);  // new prototype each call
+    }
+}
+```
+
+#### Complete Working Example
+
+```java
+// Request-scoped bean with proxy — correctly holds per-request data
+@Component
+@Scope(value = WebApplicationContext.SCOPE_REQUEST, proxyMode = ScopedProxyMode.TARGET_CLASS)
+public class RequestContext {
+
+    private final String correlationId = UUID.randomUUID().toString();
+    private String authenticatedUserId;
+
+    public String getCorrelationId() { return correlationId; }
+    public String getAuthenticatedUserId() { return authenticatedUserId; }
+    public void setAuthenticatedUserId(String id) { this.authenticatedUserId = id; }
+}
+
+// Singleton service — safely uses request-scoped data via proxy
+@Service
+public class AuditService {
+
+    private final RequestContext requestContext;  // holds a CGLIB proxy
+
+    public AuditService(RequestContext requestContext) {
+        this.requestContext = requestContext;  // proxy injected once
+    }
+
+    public void audit(String action) {
+        // Each call transparently resolves to the CURRENT request's RequestContext
+        log.info("[{}] User '{}' performed '{}'",
+            requestContext.getCorrelationId(),       // current request's correlationId
+            requestContext.getAuthenticatedUserId(), // current request's userId
+            action
+        );
+    }
+}
+
+// Servlet filter sets user on the request-scoped bean
+@Component
+public class AuthFilter extends OncePerRequestFilter {
+
+    private final RequestContext requestContext;  // also gets the proxy
+
+    public AuthFilter(RequestContext requestContext) {
+        this.requestContext = requestContext;
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest req,
+                                    HttpServletResponse res,
+                                    FilterChain chain) throws IOException, ServletException {
+        String userId = extractUserFromToken(req.getHeader("Authorization"));
+        requestContext.setAuthenticatedUserId(userId);  // sets on THIS request's instance
+        chain.doFilter(req, res);
+    }
+}
+
+// Controller — also safely uses the request-scoped bean
+@RestController
+@RequestMapping("/orders")
+public class OrderController {
+
+    private final AuditService auditService;
+
+    public OrderController(AuditService auditService) {
+        this.auditService = auditService;
+    }
+
+    @PostMapping
+    public ResponseEntity<Order> placeOrder(@RequestBody OrderRequest req) {
+        auditService.audit("PLACE_ORDER");  // logs current request's user + correlationId
+        // ...
+        return ResponseEntity.ok(order);
+    }
+}
+```
+
+> **Interview Tip:** There are two distinct mismatch problems — **web-scoped beans** (fix: `proxyMode`) and **prototype beans** (fix: `@Lookup` or `ObjectProvider`). Don't mix up the solutions. `proxyMode` on a prototype bean does NOT give you a new instance per call — it gives you the same proxy-wrapped instance created on first use.
+
+> **Gotcha:** If you call `requestContext.getClass()` on the injected proxy, you'll get something like `com.example.RequestContext$$SpringCGLIB$$0` — not `RequestContext`. This can break `instanceof` checks and serialization. Always check the actual bean class via `AopUtils.getTargetClass(proxy)` if needed.
 
 ---
 
