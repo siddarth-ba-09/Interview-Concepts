@@ -2852,87 +2852,477 @@ Also: `jstack <pid>` in the terminal — prints all thread stacks and deadlock d
 
 ## 19. Virtual Threads — Project Loom (Java 21)
 
-### The Problem with Platform Threads
+### The Problem Virtual Threads Solve — Start Here
 
-In traditional Java, each `Thread` maps 1:1 to an OS thread. OS threads are expensive:
-- ~1MB stack per thread.
-- Context switching is slow (kernel mode switch).
-- A typical JVM can handle only a few thousand OS threads.
+To understand why virtual threads exist, you need to understand the bottleneck they fix.
 
-In reactive/async style (`CompletableFuture`, WebFlux), code becomes complex and hard to debug.
+#### The Thread-Per-Request Model and Its Ceiling
 
-### Virtual Threads
+Traditional Java web servers (Tomcat, Jetty) use one **platform thread per request**. A platform thread is a thin Java wrapper over an **OS thread**.
 
-Virtual threads are **JVM-managed, extremely lightweight threads**:
-- ~few KB per virtual thread (vs ~1MB for platform thread).
-- JVM mounts virtual threads onto a small pool of **carrier threads** (platform threads).
-- When a virtual thread **blocks** (I/O, `sleep`, `wait`), it is **unmounted** from the carrier thread. The carrier thread picks up another virtual thread. **The OS thread is never blocked.**
+```
+HTTP Request 1  →  OS Thread 1  (1MB stack, kernel-managed)
+HTTP Request 2  →  OS Thread 2  (1MB stack, kernel-managed)
+HTTP Request 3  →  OS Thread 3  (1MB stack, kernel-managed)
+...
+HTTP Request N  →  OS Thread N  ← JVM crashes or refuses new requests beyond ~few thousand
+```
+
+**The problem:** Most of a web request's time is spent **waiting** — waiting for a DB query, waiting for an HTTP call to a downstream service, waiting for a cache read. While a thread waits, it's **blocked**:
+
+```
+Request lifecycle (200ms total):
+│
+├── 2ms   — parse request, routing
+├── 80ms  — blocked waiting for DB query       ← OS thread is parked, wasting kernel resources
+├── 5ms   — process result
+├── 100ms — blocked waiting for external API   ← OS thread is parked again
+├── 5ms   — serialize response
+└── 8ms   — network write
+```
+
+180ms out of 200ms this OS thread is doing **nothing**, just occupying ~1MB of memory and a kernel thread descriptor. With 500 concurrent requests, that's 500 blocked OS threads, 500MB+ of stack memory, and the OS scheduler juggling all of them.
+
+**The hard limit:** A JVM can typically sustain ~10,000–15,000 OS threads before the OS itself starts degrading (scheduler overhead, memory pressure). A modern microservice might need to handle 100,000 concurrent slow requests. You hit the wall.
+
+---
+
+#### The Reactive Workaround — And Why It's Painful
+
+To get around the thread limit, the industry adopted **reactive/async programming** (RxJava, Project Reactor, Spring WebFlux):
 
 ```java
-// Java 21 — create virtual threads
-Thread vt = Thread.ofVirtual().name("VT-1").start(() -> {
-    System.out.println("Running on: " + Thread.currentThread());
-    // blocking I/O here is fine! JVM will unmount this VT during the wait
-    String result = httpClient.send(request).body(); // does NOT block the carrier thread
-});
+// Reactive style — no blocking, callbacks everywhere
+return userRepository.findById(userId)          // returns Mono<User>
+    .flatMap(user -> accountService.fetch(user)) // chained async
+    .flatMap(account -> orderService.recent(account))
+    .map(orders -> new Dashboard(orders))
+    .onErrorReturn(Dashboard.fallback());
+```
 
-// Via executor (recommended)
+This works at scale — threads are never blocked. But the **developer experience is terrible**:
+- Stack traces are useless (the call chain spans thread pool boundaries).
+- Debugging is extremely hard.
+- Simple things like `try/catch`, `for` loops, and local variables don't work naturally.
+- Onboarding new developers takes weeks.
+- Libraries must be reactive-compatible.
+
+**Virtual threads are Java's answer:** "What if you could write simple, blocking, imperative code AND have the scalability of reactive?" That's exactly what Project Loom delivers.
+
+---
+
+### What Is a Virtual Thread?
+
+A **virtual thread** is a thread that is:
+1. **Managed entirely by the JVM** — not by the OS.
+2. **Extremely cheap to create** — a few hundred bytes of heap memory (vs ~1MB stack for OS threads).
+3. **Automatically unmounted when blocked** — the JVM detects blocking operations and parks the virtual thread, freeing the underlying OS thread immediately.
+
+The key is: **a virtual thread is not permanently attached to an OS thread**. It borrows one only when it has actual CPU work to do.
+
+---
+
+### The Carrier Thread Model — How It Works Internally
+
+The JVM maintains a small pool of **carrier threads** (OS threads, default size = number of CPU cores). Virtual threads are scheduled onto carrier threads by the JVM scheduler.
+
+```
+JVM Virtual Thread Scheduler
+│
+├── Carrier Thread Pool (e.g., 8 threads for 8-core CPU)
+│     ├── Carrier-1  [OS Thread]
+│     ├── Carrier-2  [OS Thread]
+│     ├── ...
+│     └── Carrier-8  [OS Thread]
+│
+└── Virtual Thread Queue (can hold millions of VTs)
+      ├── VT-1 (runnable)
+      ├── VT-2 (blocked on DB — unmounted, NOT in carrier pool)
+      ├── VT-3 (runnable)
+      ├── VT-4 (blocked on HTTP — unmounted)
+      ├── ...
+      └── VT-1,000,000 (waiting)
+```
+
+**Step-by-step lifecycle of one virtual thread doing a DB call:**
+
+```
+1. VT-42 is created for a new incoming HTTP request.
+2. JVM scheduler mounts VT-42 onto Carrier-3.
+   → Carrier-3 starts running VT-42's code.
+
+3. VT-42 executes:  String result = db.query("SELECT ...");
+   → This is a blocking JDBC call.
+   → JVM intercepts the blocking operation.
+
+4. JVM unmounts VT-42 from Carrier-3.
+   → VT-42's stack (continuation) is saved to the heap.
+   → Carrier-3 is FREE immediately.
+
+5. Carrier-3 picks up VT-99 from the runnable queue and runs it.
+
+6. 40ms later, the DB responds.
+   → JVM receives the data, marks VT-42 as runnable.
+   → VT-42 is placed back in the scheduler queue.
+
+7. JVM mounts VT-42 onto any available carrier (say Carrier-5).
+   → VT-42 resumes exactly where it left off (line after db.query()).
+   → result now holds the query output.
+```
+
+**The carrier thread was never blocked.** It served other virtual threads during those 40ms. This is the core efficiency gain.
+
+---
+
+### Real-Life Analogy — The Restaurant Kitchen
+
+**Platform threads model:**  
+Each customer gets their own dedicated chef. If the chef is waiting for bread to toast, they just stand there doing nothing. With 500 customers, you need 500 chefs.
+
+**Virtual threads model:**  
+A small team of 8 chefs (carrier threads) serves all customers. When a dish needs 10 minutes in the oven (I/O wait), the chef sets a timer and immediately starts a new dish. When the timer fires, any available chef picks it up and finishes it. 8 chefs, 500 orders in progress — no waste.
+
+---
+
+### Creating Virtual Threads — All the Ways
+
+```java
+// 1. Direct creation — simplest
+Thread vt = Thread.ofVirtual().start(() -> handleRequest(req));
+
+// 2. With a name (useful for debugging)
+Thread vt = Thread.ofVirtual()
+    .name("request-handler-", 0) // auto-numbered: request-handler-0, request-handler-1, ...
+    .start(() -> handleRequest(req));
+
+// 3. As a ThreadFactory (integrate with existing code that accepts ThreadFactory)
+ThreadFactory vtFactory = Thread.ofVirtual().factory();
+Thread vt = vtFactory.newThread(() -> handleRequest(req));
+
+// 4. Via ExecutorService — most common for servers
+// newVirtualThreadPerTaskExecutor: creates one new virtual thread PER submitted task
 try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
-    for (int i = 0; i < 1_000_000; i++) {
-        int taskId = i;
-        executor.submit(() -> processRequest(taskId)); // 1 million virtual threads — fine!
+    for (Request req : incomingRequests) {
+        executor.submit(() -> handleRequest(req)); // each gets its own VT — totally fine
     }
-} // auto-close shuts down executor
+} // try-with-resources: shuts down cleanly
+
+// 5. Check if current thread is virtual
+Thread.currentThread().isVirtual(); // true inside a virtual thread
 ```
 
-### Structured Concurrency (Java 21 Preview)
+---
+
+### Virtual Threads in a Spring Boot Server
+
+Spring Boot 3.2+ supports virtual threads with a single configuration:
+
+```yaml
+# application.yml
+spring:
+  threads:
+    virtual:
+      enabled: true
+```
+
+Or in Java config:
 
 ```java
-try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
-    Future<User>    user    = scope.fork(() -> fetchUser(id));
-    Future<Account> account = scope.fork(() -> fetchAccount(id));
+@Configuration
+public class VirtualThreadConfig {
 
-    scope.join();           // wait for both
-    scope.throwIfFailed();  // propagate any failure
-
-    return new Dashboard(user.resultNow(), account.resultNow());
+    // Replace Tomcat's thread pool with virtual threads
+    @Bean
+    public TomcatProtocolHandlerCustomizer<?> virtualThreadTomcat() {
+        return protocolHandler ->
+            protocolHandler.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
+    }
 }
-// If either task fails, the other is cancelled automatically
 ```
 
-### Virtual Threads vs Platform Threads
+Now every incoming HTTP request is handled by a virtual thread. Your `@RestController` code stays **exactly the same** — no reactive, no `CompletableFuture`, just plain blocking code:
+
+```java
+@RestController
+public class OrderController {
+
+    @GetMapping("/orders/{userId}")
+    public Dashboard getDashboard(@PathVariable String userId) {
+        // All of these are blocking calls — totally fine with virtual threads!
+        User    user    = userRepository.findById(userId);    // blocks VT, not carrier
+        Account account = accountService.fetch(userId);       // blocks VT, not carrier
+        List<Order> orders = orderService.recent(userId, 10); // blocks VT, not carrier
+
+        return new Dashboard(user, account, orders);
+        // Readable, debuggable, simple. No reactive boilerplate.
+    }
+}
+```
+
+Under 100,000 concurrent requests, each blocked on a different DB call, you have 100,000 virtual threads, all paused in the VT scheduler — but only ~N carrier threads (one per CPU core) in the OS. Zero OS thread pressure.
+
+---
+
+### Virtual Threads vs CompletableFuture — When to Use Which
+
+```
+┌─────────────────────────────┬──────────────────────────────────────────┐
+│ Scenario                    │ Use                                      │
+├─────────────────────────────┼──────────────────────────────────────────┤
+│ Simple blocking code        │ Virtual threads — write normal code      │
+│ (DB, HTTP, cache reads)     │                                          │
+├─────────────────────────────┼──────────────────────────────────────────┤
+│ Parallel fan-out             │ CompletableFuture.allOf() or             │
+│ (3 services in parallel,    │ StructuredTaskScope (Java 21)            │
+│ combine results)            │                                          │
+├─────────────────────────────┼──────────────────────────────────────────┤
+│ Pipeline with transforms    │ CompletableFuture chains                 │
+│ (A then B then C)           │                                          │
+├─────────────────────────────┼──────────────────────────────────────────┤
+│ Timeout + fallback on       │ CompletableFuture.orTimeout()            │
+│ a specific stage            │ + exceptionally()                        │
+├─────────────────────────────┼──────────────────────────────────────────┤
+│ High-throughput I/O server  │ Virtual threads + blocking JDBC/HTTP     │
+│ (replacing WebFlux)         │                                          │
+└─────────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+### Structured Concurrency — The Right Way to Fan-Out with Virtual Threads
+
+`CompletableFuture` fan-out works but has a flaw: if one task fails, the others keep running unless you explicitly cancel them. **Structured Concurrency** fixes this.
+
+**`StructuredTaskScope.ShutdownOnFailure`** — cancel all if any fails:
+
+```java
+// Goal: fetch user + account in parallel; if either fails, cancel the other
+try (var scope = new StructuredTaskScope.ShutdownOnFailure()) {
+
+    Subtask<User>    userTask    = scope.fork(() -> userService.fetch(userId));
+    Subtask<Account> accountTask = scope.fork(() -> accountService.fetch(userId));
+
+    scope.join();           // wait for both subtasks to finish (or one to fail)
+    scope.throwIfFailed();  // if any subtask threw, re-throw here
+
+    // Both succeeded — safe to use results
+    return new Dashboard(userTask.get(), accountTask.get());
+
+} catch (ExecutionException e) {
+    // One of the subtasks threw — the other was automatically cancelled
+    throw new DashboardException("Failed to load dashboard", e.getCause());
+}
+// When the scope closes (try-with-resources), ALL forked tasks are guaranteed to be done
+// No "orphaned" tasks running in the background
+```
+
+**`StructuredTaskScope.ShutdownOnSuccess`** — cancel all once the FIRST succeeds (race pattern):
+
+```java
+// Goal: try primary and backup simultaneously; use whoever responds first
+try (var scope = new StructuredTaskScope.ShutdownOnSuccess<User>()) {
+
+    scope.fork(() -> primaryUserService.fetch(userId));   // race between these two
+    scope.fork(() -> backupUserService.fetch(userId));
+
+    scope.join(); // returns as soon as the first succeeds; cancels the other
+
+    return scope.result(); // the winning result
+
+} catch (ExecutionException e) {
+    throw new UserNotFoundException("Both services failed", e.getCause());
+}
+```
+
+**Why Structured Concurrency is better than raw `CompletableFuture`:**
+
+| Concern | CompletableFuture | StructuredTaskScope |
+|---|---|---|
+| Cancellation on failure | Manual `.cancel()` on each future | Automatic — scope shuts down all |
+| Orphaned tasks | Possible if you forget to cancel | Impossible — scope is bounded |
+| Stack trace clarity | Tasks run on pool threads, confusing traces | Parent-child relationship preserved |
+| Error propagation | `CompletionException` wrapping | Direct `ExecutionException` |
+| Code clarity | Callback chains | Sequential, readable code |
+
+---
+
+### Pinning — The Most Important Virtual Thread Gotcha
+
+A virtual thread is **pinned to its carrier thread** and **cannot be unmounted** when it's inside:
+
+1. A `synchronized` block or method.
+2. A native method or foreign function call (JNI).
+
+When a pinned virtual thread performs a blocking operation, the carrier thread **blocks with it** — exactly like a platform thread. You lose all the benefit.
+
+```
+Normal case (no pinning):
+VT blocks → JVM unmounts VT → carrier thread is FREE → serves other VTs  ✅
+
+Pinned case (inside synchronized):
+VT blocks → JVM CANNOT unmount (pinned) → carrier thread is BLOCKED → 
+  other VTs waiting for a free carrier → throughput collapses ❌
+```
+
+**Detecting pinning:** Run with:
+```
+-Djdk.tracePinnedThreads=full
+```
+This prints a stack trace every time a virtual thread is pinned and blocks.
+
+**Common pinning culprits in real code:**
+
+```java
+// PROBLEM 1: synchronized around a blocking operation
+public synchronized Order fetchOrder(String id) {  // synchronized method
+    return jdbcTemplate.queryForObject(...);        // blocking DB call → PINS carrier thread!
+}
+
+// FIX 1: replace synchronized with ReentrantLock
+private final ReentrantLock lock = new ReentrantLock();
+
+public Order fetchOrder(String id) {
+    lock.lock();
+    try {
+        return jdbcTemplate.queryForObject(...); // VT can unmount here — lock is not a pin
+    } finally {
+        lock.unlock();
+    }
+}
+
+// PROBLEM 2: synchronized block around blocking I/O
+public void sendNotification(String userId) {
+    synchronized (this) {                      // enters synchronized block
+        httpClient.send(buildRequest(userId)); // blocking HTTP call → PINS!
+    }
+}
+
+// FIX 2: narrow the synchronized to non-blocking state access only
+public void sendNotification(String userId) {
+    HttpRequest req;
+    synchronized (this) {
+        req = buildRequest(userId); // fast, non-blocking state access
+    }
+    httpClient.send(req); // blocking call is OUTSIDE synchronized — can unmount
+}
+```
+
+**Note:** Java 24+ (JEP 491) removes the synchronized pinning restriction entirely. On Java 21-23, use the mitigation above.
+
+---
+
+### Virtual Threads Are NOT for CPU-Bound Work
+
+Virtual threads shine for **I/O-bound** workloads. They don't help — and can hurt — for **CPU-bound** work.
+
+**Why?**
+- A CPU-bound virtual thread never blocks → never unmounts → stays mounted on a carrier the whole time.
+- You get no benefit over a platform thread.
+- If you spawn millions of CPU-bound VTs, the JVM scheduler overhead itself becomes a bottleneck.
+
+```java
+// CPU-BOUND: computing a hash of a large file
+// BAD — virtual threads add overhead with no benefit
+try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+    for (File f : files) {
+        executor.submit(() -> sha256(f)); // CPU work — never blocks
+    }
+}
+
+// GOOD — use a fixed thread pool sized to CPU cores
+try (var executor = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors())) {
+    for (File f : files) {
+        executor.submit(() -> sha256(f));
+    }
+}
+```
+
+**Rule:** Virtual threads = I/O-bound (DB, HTTP, file, cache). Fixed thread pool = CPU-bound (hashing, encryption, image processing, ML inference).
+
+---
+
+### Don't Pool Virtual Threads
+
+With platform threads, you pool them because creation is expensive (~1MB, kernel call). Virtual threads are so cheap (~few hundred bytes, no kernel call) that **pooling them is an anti-pattern**:
+
+```java
+// WRONG: pooling virtual threads
+ExecutorService pool = Executors.newFixedThreadPool(200); // don't do this with VTs!
+// This defeats the whole point — you've re-introduced a thread limit
+
+// CORRECT: one virtual thread per task, no pooling
+ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+// Creates a new VT for every task — that's intentional and correct
+```
+
+**Why pooling is wrong:** A thread pool limits concurrency to pool size. If all 200 threads are blocked on DB calls, the 201st request waits even though no CPU is actually busy. With virtual threads, you want unlimited concurrency — the JVM scheduler handles it.
+
+---
+
+### ThreadLocal With Virtual Threads — The Scale Problem
+
+`ThreadLocal` works correctly with virtual threads, but there's a subtle issue at scale:
+
+```java
+// Each virtual thread gets its own ThreadLocal copy — correct behavior
+ThreadLocal<String> requestId = new ThreadLocal<>();
+
+// In a virtual thread:
+requestId.set("req-42"); // stored in THIS virtual thread's local map
+// ...
+String id = requestId.get(); // retrieves "req-42" — correct
+```
+
+**The problem:** With 1 million virtual threads, each holding a `ThreadLocal` map with 10 entries, that's 10 million ThreadLocal map entries in memory simultaneously. On platform threads (max ~10k), this was fine. At VT scale, it can cause memory pressure.
+
+**Java 21 solution: Scoped Values (Preview)**
+
+```java
+// ScopedValue: immutable, automatically released when scope exits, no memory leak
+ScopedValue<String> REQUEST_ID = ScopedValue.newInstance();
+
+ScopedValue.where(REQUEST_ID, "req-42").run(() -> {
+    processRequest(); // REQUEST_ID.get() returns "req-42" inside here
+    callService();    // and in any method called from here, in the same thread
+});
+// After this block, the binding is automatically released — no remove() needed
+```
+
+`ScopedValue` is the recommended replacement for `ThreadLocal` in virtual thread code.
+
+---
+
+### Virtual Threads vs Platform Threads — Complete Comparison
 
 | Aspect | Platform Thread | Virtual Thread |
 |---|---|---|
-| Managed by | OS | JVM |
-| Stack size | ~1MB | ~few KB |
-| Max count | ~thousands | Millions |
-| Blocking I/O | Wastes OS thread | JVM unmounts, no waste |
-| Context switch | Expensive (kernel) | Cheap (JVM) |
-| Use case | CPU-bound, small count | I/O-bound, high concurrency |
+| Managed by | OS kernel | JVM scheduler |
+| Stack memory | ~1MB fixed | Few KB, grows on heap as needed |
+| Max practical count | ~10,000–15,000 | Millions |
+| Creation cost | Expensive (kernel call) | Nearly free (heap alloc) |
+| Blocking I/O behavior | OS thread parks, kernel context switch | JVM unmounts, carrier thread is free |
+| Context switch cost | Expensive (user→kernel→user mode) | Cheap (JVM continuation swap) |
+| Pinning risk | None | Yes — `synchronized` + blocking |
+| CPU-bound work | Best choice | No benefit |
+| I/O-bound work | Limited by thread count | Ideal — unlimited concurrency |
+| Code style | Imperative (natural) | Imperative (natural — same!) |
+| Thread pool | Yes, always | No — create per task |
+| `ThreadLocal` | Fine | Works but use ScopedValue at scale |
+| Debugging | Good stack traces | Good stack traces (better than reactive) |
+| Java version | All versions | Java 21+ (stable) |
 
-### Pinning — The Virtual Thread Gotcha
+---
 
-A virtual thread is **pinned** (cannot unmount) when it's inside:
-1. A `synchronized` block/method.
-2. A native method or foreign function call.
+### Common Pitfalls
 
-If pinned and blocked, it **blocks the carrier thread** — losing the benefit. Fix: replace `synchronized` with `ReentrantLock`.
-
-```java
-// BEFORE (pins carrier thread if blocked inside)
-synchronized (lock) {
-    Thread.sleep(100);
-}
-
-// AFTER (virtual thread can unmount)
-reentrantLock.lock();
-try {
-    Thread.sleep(100); // or any blocking op
-} finally {
-    reentrantLock.unlock();
-}
-```
+| Pitfall | What goes wrong | Fix |
+|---|---|---|
+| `synchronized` around blocking I/O | Virtual thread pinned → carrier blocked → throughput collapses | Replace `synchronized` with `ReentrantLock` |
+| Pooling virtual threads | Re-introduces the concurrency limit virtual threads are designed to remove | Use `newVirtualThreadPerTaskExecutor()` — one VT per task |
+| Using VTs for CPU-bound work | No benefit, scheduler overhead | Use `newFixedThreadPool(nCores)` for CPU work |
+| `ThreadLocal` holding large objects at VT scale | Memory pressure with millions of VTs | Use `ScopedValue` |
+| Assuming VTs are faster than platform threads per task | VTs reduce **contention and resource use**, not per-task speed | VTs shine when there are many concurrent blocked tasks, not few fast ones |
+| Third-party libs using `synchronized` internally | Pinning happens inside library code you don't control | Upgrade to VT-aware lib versions; monitor with `-Djdk.tracePinnedThreads=full` |
 
 ---
 
